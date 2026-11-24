@@ -145,8 +145,10 @@ class MultiHeadAttention(nn.Module):
             k = k.unflatten(-1, (self.n_head, -1))
             v = v.unflatten(-1, (self.n_head, -1))
             out = varlen_attn(
-                q, k, v, q_info[0], kv_info[0], q_info[1], kv_info[1],
-                is_causal=causal)
+                query=q, key=k, value=v,
+                cu_seq_q=q_info[0], cu_seq_k=kv_info[0],
+                max_q=q_info[1], max_k=kv_info[1],
+                window_size=(-1, 0) if causal else (-1, -1))
             return self.w_concat(out.flatten(-2))
 
         # 2. split tensor by number of heads
