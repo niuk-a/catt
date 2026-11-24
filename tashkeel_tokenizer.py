@@ -19,6 +19,8 @@ TATWEEL = u'\u0640'
 HARAKAT_PAT = re.compile(u"["+u"".join([FATHATAN, DAMMATAN, KASRATAN,
                                         FATHA, DAMMA, KASRA, SUKUN,
                                         SHADDA])+u"]")
+ARABIC_TO_BUCKWALTER = str.maketrans(bw2ar.uni2buck)
+LETTER_TASHKEEL_PAT = re.compile(r'([^FNKauio~])(~[FNKaui]|[FNKauio~])?')
 
 
 class TashkeelTokenizer:
@@ -74,7 +76,7 @@ class TashkeelTokenizer:
 
     def split_tashkeel_from_text(self, text_with_tashkeel, test_match=True):
         text_with_tashkeel = self.clean_text(text_with_tashkeel)
-        text_with_tashkeel = bw2ar.transliterate_text(text_with_tashkeel, 'ar2bw')
+        text_with_tashkeel = text_with_tashkeel.translate(ARABIC_TO_BUCKWALTER)
         text_with_tashkeel = text_with_tashkeel.replace('`', '') # remove dagger 'alif
 
         # unify the order of shaddah and the harakah to make shaddah always at the beginning
@@ -84,29 +86,11 @@ class TashkeelTokenizer:
         for i in range(len(self.tahkeel_chars)):
             text_with_tashkeel = text_with_tashkeel.replace(self.tahkeel_chars[i]*2, self.tahkeel_chars[i])
 
-        letter_n_tashkeel_pairs = []
-        for i in range(len(text_with_tashkeel)): # go over the whole text
-            # check if the first character is a normal letter and the second character is a tashkeel
-            if i < (len(text_with_tashkeel) - 1) and not text_with_tashkeel[i] in self.tashkeel_list and text_with_tashkeel[i+1] in self.tashkeel_list:
-                # IMPORTANT: check if tashkeel is Shaddah, then there might be another Tashkeel char associated with it. If so,
-                # replace both Shaddah and the Tashkeel chars with the appropriate tag
-                if text_with_tashkeel[i+1] == '~':
-                    # IMPORTANT: the following if statement depends on the concept of short circuit!!
-                    # The first condition checks if there are still more chars before it access position i+2
-                    # "text_with_tashkeel[i+2]" since it causes "index out of range" exception. Notice that
-                    # Shaddah here is put in the first position before the Harakah.
-                    if i+2 < len(text_with_tashkeel) and f'~{text_with_tashkeel[i+2]}' in self.inverse_tags:
-                        letter_n_tashkeel_pairs.append((text_with_tashkeel[i], self.inverse_tags[f'~{text_with_tashkeel[i+2]}']))
-                    else:
-                        # if it is only Shaddah, just add it to the list
-                        letter_n_tashkeel_pairs.append((text_with_tashkeel[i], '~'))
-                else:
-                    letter_n_tashkeel_pairs.append((text_with_tashkeel[i], text_with_tashkeel[i+1]))
-            # if the character at position i is a normal letter and has no Tashkeel, then add
-            # it with the tag "self.no_tashkeel_tag"
-            # IMPORTANT: this elif block ensures also that there is no two or more consecutive tashkeel other than shaddah
-            elif not text_with_tashkeel[i] in self.tashkeel_list:
-                letter_n_tashkeel_pairs.append((text_with_tashkeel[i], self.no_tashkeel_tag))
+        # Match each letter with its first mark or shaddah pair; skip unattached marks.
+        letter_n_tashkeel_pairs = [
+            (letter, self.inverse_tags.get(mark, mark) if mark else self.no_tashkeel_tag)
+            for letter, mark in LETTER_TASHKEEL_PAT.findall(text_with_tashkeel)
+        ]
 
         if test_match:
             # test if the split is done correctly by ensuring that we can retrieve back the original text
