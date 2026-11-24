@@ -1,94 +1,264 @@
+import argparse
+import json
+import random
+from datetime import datetime, timezone
+from functools import partial
+from pathlib import Path
+
 import torch
-import pickle
-from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.callbacks.progress import TQDMProgressBar
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from tashkeel_dataset import TashkeelDataset, PrePaddingDataLoader
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from ed_pl import TashkeelModel
+from tashkeel_dataset import TashkeelDataset, BufferedBatchSampler, collate_packed
 from tashkeel_tokenizer import TashkeelTokenizer
 
-def freeze(model):
-    for param in model.parameters():
-        param.requires_grad = False
 
-def unfreeze(model):
-    for param in model.parameters():
-        param.requires_grad = True
-
-# Model's Configs
-model_type = 'ed' # 'eo' for Encoder-Only OR 'ed' for Encoder-Decoder
-dl_num_workers = 32
-batch_size = 32
-max_seq_len = 1024
-threshold = 0.6
-
-# Pretrained Char-Based BERT
-pretrained_mlm_pt = None # Use None if you want to initialize weights randomly OR the path to the char-based BERT
-#pretrained_mlm_pt = 'char_bert_model_pretrained.pt'
-
-train_txt_folder_path = 'dataset/train'
-val_txt_folder_path = 'dataset/val'
-test_txt_folder_path = 'dataset/test'
-
-
-if model_type == 'ed':
-    from ed_pl import TashkeelModel
-else:
-    from eo_pl import TashkeelModel
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train packed CATT on one CUDA GPU.')
+    parser.add_argument('--train-dir', default='dataset/train')
+    parser.add_argument('--val-dir', default='dataset/val')
+    parser.add_argument('--output-dir', default='/data/catt')
+    parser.add_argument('--pretrained', default='models/char_bert_model_pretrained.pt',
+                        help='Pretrained weights; pass an empty string for random initialization.')
+    parser.add_argument('--resume', help='Resume a full checkpoint at the next epoch.')
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--tokens-per-batch', type=int, default=16384,
+                        help='Static token capacity; real token count must be below this limit.')
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--max-seq-len', type=int, default=1024)
+    parser.add_argument('--threshold', type=float, default=0.6)
+    parser.add_argument('--lr', type=float, default=3e-5)
+    parser.add_argument('--log-every', type=int, default=100,
+                        help='Flush buffered metrics every N records.')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+    if args.batch_size < 1 or args.tokens_per_batch < 2 or args.max_seq_len < 1:
+        parser.error('Batch size and maximum sequence length must be positive; token capacity must exceed 1.')
+    if args.log_every < 1:
+        parser.error('--log-every must be positive.')
+    return args
 
 
-tokenizer = TashkeelTokenizer()
+class MetricLogger:
+    def __init__(self, path, flush_every):
+        self.path = path
+        self.flush_every = flush_every
+        self.records = []
 
-print('Creating Train Dataset...')
-train_dataset = TashkeelDataset(train_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-print('Creating Train Dataloader...')
-train_dataloader = PrePaddingDataLoader(tokenizer, train_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=True)
+    def __enter__(self):
+        self.file = self.path.open('a')
+        return self
 
-print('Creating Validation Dataset...')
-val_dataset = TashkeelDataset(val_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-print('Creating Validation Dataloader...')
-val_dataloader = PrePaddingDataLoader(tokenizer, val_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=False)
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self._flush()
+        finally:
+            self.file.close()
 
-print('Creating Test Dataset...')
-test_dataset = TashkeelDataset(test_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-print('Creating Test Dataloader...')
-test_dataloader = PrePaddingDataLoader(tokenizer, test_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=False)
+    def log(self, **metrics):
+        self.records.append({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            **{key: value.detach() if isinstance(value, torch.Tensor) else value
+               for key, value in metrics.items()},
+        })
+        if len(self.records) >= self.flush_every:
+            self._flush()
 
-print('Creating Model...')
-model = TashkeelModel(tokenizer, max_seq_len=max_seq_len, n_layers=6, learnable_pos_emb=False)
+    def _flush(self):
+        if not self.records:
+            return
+        tensor_fields = [(record, key) for record in self.records
+                         for key, value in record.items() if isinstance(value, torch.Tensor)]
+        if tensor_fields:
+            # Transfer buffered scalar metrics together without retaining autograd graphs.
+            values = torch.stack([record[key] for record, key in tensor_fields]).cpu().tolist()
+            for (record, key), value in zip(tensor_fields, values):
+                record[key] = value
+        self.file.writelines(json.dumps(record) + '\n' for record in self.records)
+        self.file.flush()
+        self.records.clear()
 
-# Use the pretrained weights of the char-based BERT model to initialize the model
-if not pretrained_mlm_pt is None:
-    missing = model.transformer.load_state_dict(torch.load(pretrained_mlm_pt), strict=False)
-    print(f'Missing layers: {missing}')
 
-# This is to freeze the encoder weights
-#freeze(model.transformer.encoder)
+def to_cuda(batch):
+    return {key: value.to('cuda', non_blocking=True) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()}
 
-dirpath = f'catt_{model_type}_model_v1/'
 
-checkpoint_callback = ModelCheckpoint(dirpath=dirpath, save_top_k=10, save_last=True,
-                                      monitor='val_der',
-                                      filename=f'catt_{model_type}_model' + '-{epoch:02d}-{val_loss:.5f}-{val_der:.5f}')
+def forward(model, batch):
+    return model(x=batch['src'], y=batch['trg'], cu_seqlens=batch['cu_seqlens'],
+                 max_seqlen=batch['max_seqlen'], positions=batch['positions'])
 
-print('Creating Trainer...')
 
-logs_path = f'{dirpath}/logs'
+@torch.no_grad()
+def validate(model, loader, tokenizer):
+    model.eval()
+    loss_sum = torch.zeros((), device='cuda')
+    token_count = distance = ref_length = 0
+    for cpu_batch in tqdm(loader, desc='Validation'):
+        batch = to_cuda(cpu_batch)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            logits = forward(model=model, batch=batch)
+            loss_sum += F.cross_entropy(logits, batch['labels'], reduction='sum')
+        tokens = batch['tokens']
+        token_count += tokens
+        predictions = logits[:tokens].argmax(-1).cpu().split(cpu_batch['lengths'])
+        sources = cpu_batch['src'][:tokens].split(cpu_batch['lengths'])
+        targets = cpu_batch['labels'][:tokens].split(cpu_batch['lengths'])
+        for src, pred, target in zip(sources, predictions, targets):
+            hyp = tokenizer.decode(src.unsqueeze(0), pred.unsqueeze(0))[0]
+            ref = tokenizer.decode(src.unsqueeze(0), target.unsqueeze(0))[0]
+            der = tokenizer.compute_der(ref, hyp)
+            distance += der['distance']
+            ref_length += der['ref_length']
+    return {'val_loss': loss_sum.item() / token_count,
+            'val_der': distance / max(ref_length, 1),
+            'val_der_distance': distance, 'val_der_ref_length': ref_length,
+            'val_der_mode': 'teacher_forced'}
 
-print('#'*100)
-print(model)
-print('#'*100)
 
-trainer = Trainer(
-    #accelerator="cpu",
-    accelerator="cuda",
-    devices=-1,
-    max_epochs=300,
-    callbacks=[TQDMProgressBar(refresh_rate=1), checkpoint_callback],
-    logger=CSVLogger(save_dir=logs_path),
-#    strategy="ddp_find_unused_parameters_false"
-    )
+def main():
+    args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.set_device(0)
+    generator = torch.Generator().manual_seed(args.seed)
 
-#ckpt_path = 'YOUR_CKPT_PATH_GOES_HERE'
-#trainer.fit(model, train_dataloader, val_dataloader, ckpt_path=ckpt_path)
-trainer.fit(model, train_dataloader, val_dataloader)
+    run_dir = Path(args.output_dir) / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+    checkpoint_dir = run_dir / 'checkpoints'
+    profile_dir = run_dir / 'profiles'
+    checkpoint_dir.mkdir(parents=True)
+    profile_dir.mkdir()
+    config = {**vars(args), 'device': torch.cuda.get_device_name(0),
+              'precision': 'bf16-mixed', 'compile': {'backend': 'inductor', 'dynamic': False},
+              'optimizer': {'name': 'AdamW', 'fused': True},
+              'fallback_token_capacity': args.batch_size * args.max_seq_len + 1,
+              'torch_version': str(torch.__version__), 'cuda_version': torch.version.cuda,
+              'attention': 'torch.nn.attention.varlen.varlen_attn',
+              'model': {'d_model': 512, 'n_layers': 3, 'n_heads': 16,
+                        'drop_prob': 0.1, 'learnable_pos_emb': False}}
+    (run_dir / 'run_config.json').write_text(json.dumps(config, indent=2) + '\n')
+    print(f'Run artifacts: {run_dir}')
+
+    tokenizer = TashkeelTokenizer()
+    train_dataset = TashkeelDataset(args.train_dir, tokenizer, args.max_seq_len, args.threshold)
+    val_dataset = TashkeelDataset(args.val_dir, tokenizer, args.max_seq_len, args.threshold)
+    if min(len(train_dataset), len(val_dataset)) < args.batch_size:
+        raise ValueError('Training and validation datasets must each contain at least one full batch.')
+    collate_fn = partial(collate_packed, token_capacity=args.tokens_per_batch,
+                         max_seq_len=args.max_seq_len,
+                         src_pad_idx=tokenizer.letters_map['<PAD>'],
+                         trg_pad_idx=tokenizer.tashkeel_map['<PAD>'])
+    loader_options = dict(num_workers=args.num_workers,
+                          collate_fn=collate_fn, pin_memory=True,
+                          persistent_workers=args.num_workers > 0)
+    train_sampler = BufferedBatchSampler(train_dataset.lengths, args.batch_size,
+                                         args.tokens_per_batch, shuffle=True, generator=generator)
+    val_sampler = BufferedBatchSampler(val_dataset.lengths, args.batch_size, args.tokens_per_batch)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                             generator=generator, **loader_options)
+    val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, **loader_options)
+
+    model = TashkeelModel(tokenizer, max_seq_len=args.max_seq_len,
+                         **config['model']).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=1 / 1.000001)
+    start_epoch = global_step = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
+        if checkpoint['config']['max_seq_len'] != args.max_seq_len:
+            raise ValueError('--max-seq-len must match the resumed checkpoint.')
+        model.load_state_dict(checkpoint['state_dict'])
+        # Keep fused execution when resuming checkpoints from the previous optimizer.
+        for group in checkpoint['optimizer']['param_groups']:
+            group.update(fused=True, foreach=False)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch, global_step = checkpoint['epoch'], checkpoint['global_step']
+        torch.set_rng_state(checkpoint['torch_rng_state'])
+        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+        random.setstate(checkpoint['python_rng_state'])
+        generator.set_state(checkpoint['loader_rng_state'])
+    elif args.pretrained:
+        weights = torch.load(args.pretrained, map_location='cpu', weights_only=True)
+        weights = weights.get('state_dict', weights)
+        weights = {key.removeprefix('transformer.'): value for key, value in weights.items()}
+        print(f'Pretrained weights: {model.transformer.load_state_dict(weights, strict=False)}')
+
+    compiled_model = torch.compile(model, backend='inductor', dynamic=False)
+    launch_steps = 0
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+
+    def save_trace(profiler):
+        # Do not label an incomplete capture as a two-step profile.
+        if launch_steps >= 17:
+            profiler.export_chrome_trace(str(profile_dir / 'train-steps-16-17.json'))
+
+    with (
+        torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=0, warmup=15, active=2, repeat=1),
+            on_trace_ready=save_trace, record_shapes=True, profile_memory=True,
+        ) as profiler,
+        MetricLogger(path=run_dir / 'metrics.jsonl', flush_every=args.log_every) as logger,
+    ):
+        for epoch in range(start_epoch + 1, args.epochs + 1):
+            compiled_model.train()
+            if 0 < launch_steps < 17:
+                profiler.toggle_collection_dynamic(True, activities)
+            train_loss_sum = torch.zeros((), device='cuda')
+            train_tokens = 0
+            for cpu_batch in tqdm(train_loader, desc=f'Epoch {epoch}'):
+                batch = to_cuda(cpu_batch)
+                optimizer.zero_grad(set_to_none=True)
+                lr = optimizer.param_groups[0]['lr']
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    logits = forward(model=compiled_model, batch=batch)
+                    loss = F.cross_entropy(logits, batch['labels'])
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                global_step += 1
+                launch_steps += 1
+                tokens = batch['tokens']
+                train_loss_sum += loss.detach() * tokens
+                train_tokens += tokens
+                logger.log(event='train_step', epoch=epoch, step=global_step,
+                           train_loss=loss, lr=lr, tokens=tokens,
+                           token_capacity=batch['labels'].numel())
+                if launch_steps <= 17:
+                    profiler.step()
+
+            # Validation/checkpoint work must not enter the two training-step trace,
+            # including when a small dataset puts steps 16 and 17 in different epochs.
+            if launch_steps < 17:
+                profiler.toggle_collection_dynamic(False, activities)
+            metrics = validate(compiled_model, val_loader, tokenizer)
+            metrics['train_loss'] = train_loss_sum.item() / train_tokens
+            logger.log(event='epoch_end', epoch=epoch, step=global_step, **metrics)
+            checkpoint = {
+                'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(), 'epoch': epoch,
+                'global_step': global_step, 'config': config, 'metrics': metrics,
+                'torch_rng_state': torch.get_rng_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state_all(),
+                'python_rng_state': random.getstate(), 'loader_rng_state': generator.get_state(),
+            }
+            checkpoint_path = checkpoint_dir / f'epoch-{epoch:04d}.ckpt'
+            temporary_path = checkpoint_path.with_suffix('.tmp')
+            torch.save(checkpoint, temporary_path)
+            temporary_path.replace(checkpoint_path)
+            last_link = checkpoint_dir / 'last.tmp'
+            last_link.symlink_to(checkpoint_path.name)
+            last_link.replace(checkpoint_dir / 'last.ckpt')
+            print(f'Saved {checkpoint_path}; val_loss={metrics["val_loss"]:.5f}, '
+                  f'val_der={metrics["val_der"]:.5f}')
+        if launch_steps < 17:
+            logger.log(event='profile_incomplete', train_steps=launch_steps,
+                       required_steps=17)
+
+
+if __name__ == '__main__':
+    main()

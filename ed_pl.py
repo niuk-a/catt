@@ -1,14 +1,9 @@
 
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
 from ed import Transformer
 from tqdm import tqdm
 import math
-import torch
-import torch.nn as nn
 
 from torch.nn.utils.rnn import pad_sequence
 # sequences is a list of tensors of shape TxH where T is the seqlen and H is the feats dim
@@ -31,7 +26,7 @@ def get_batches(X, batch_size=16):
         yield x
 
 
-class TashkeelModel(pl.LightningModule):
+class TashkeelModel(nn.Module):
     def __init__(self, tokenizer, max_seq_len, d_model=512, n_layers=3, n_heads=16, drop_prob=0.1, learnable_pos_emb=True):
 
         super(TashkeelModel, self).__init__()
@@ -58,68 +53,9 @@ class TashkeelModel(pl.LightningModule):
         self.tokenizer = tokenizer
 
 
-    def forward(self, x, y=None):
-        y_pred = self.transformer(x, y)
-        return y_pred
-
-
-    def training_step(self, batch, batch_idx):
-        input_ids, target_ids = batch
-        input_ids = input_ids[:, :-1]
-        y_in = target_ids[:, :-1]
-        y_out = target_ids[:, 1:]
-        y_pred = self(input_ids, y_in)
-        loss = self.criterion(y_pred.transpose(1, 2), y_out)
-
-        self.log('train_loss', loss, prog_bar=True)
-        sch = self.lr_schedulers()
-        sch.step()
-        self.log('lr', sch.get_last_lr()[0], prog_bar=True)
-        return loss
-
-
-    def validation_step(self, batch, batch_idx):
-        input_ids, target_ids = batch
-        input_ids = input_ids[:, :-1]
-        y_in = target_ids[:, :-1]
-        y_out = target_ids[:, 1:]
-        y_pred = self(input_ids, y_in)
-        loss = self.criterion(y_pred.transpose(1, 2), y_out)
-
-        pred_text_with_tashkeels = self.tokenizer.decode(input_ids, y_pred.argmax(2).squeeze())
-        true_text_with_tashkeels = self.tokenizer.decode(input_ids, y_out)
-        total_val_der_distance = 0
-        total_val_der_ref_length = 0
-        for i in range(len(true_text_with_tashkeels)):
-            pred_text_with_tashkeel = pred_text_with_tashkeels[i]
-            true_text_with_tashkeel = true_text_with_tashkeels[i]
-            val_der = self.tokenizer.compute_der(true_text_with_tashkeel, pred_text_with_tashkeel)
-            total_val_der_distance += val_der['distance']
-            total_val_der_ref_length += val_der['ref_length']
-
-        total_der_error = total_val_der_distance / total_val_der_ref_length
-        self.log('val_loss', loss)
-        self.log('val_der', torch.FloatTensor([total_der_error]))
-        self.log('val_der_distance', torch.FloatTensor([total_val_der_distance]))
-        self.log('val_der_ref_length', torch.FloatTensor([total_val_der_ref_length]))
-
-
-    def test_step(self, batch, batch_idx):
-        input_ids, target_ids = batch
-        y_pred = self(input_ids, None)
-        loss = self.criterion(y_pred.transpose(1, 2), target_ids)
-        self.log('test_loss', loss)
-
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=3e-4)
-        #max_iters = 10000
-        #lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters, eta_min=3e-6)
-        gamma = 1 / 1.000001
-        #gamma = 1 / 1.0001
-        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma)
-        opts = {"optimizer": optimizer,  "lr_scheduler": lr_scheduler}
-        return opts
+    def forward(self, x, y=None, cu_seqlens=None, max_seqlen=None, positions=None):
+        return self.transformer(src=x, trg=y, cu_seqlens=cu_seqlens,
+                                max_seqlen=max_seqlen, positions=positions)
 
 
     @torch.no_grad()
@@ -141,7 +77,7 @@ class TashkeelModel(pl.LightningModule):
             src = batch_input_ids.to(device)
 
             src_mask = self.transformer.make_pad_mask(src, src, self.transformer.src_pad_idx, self.transformer.src_pad_idx).to(device)
-            enc_src = self.transformer.encoder(src, src_mask)
+            enc_src = self.transformer.encoder(x=src, s_mask=src_mask)
 
             for i in range(src.shape[1] - 1):
                 trg = target_ids
@@ -149,7 +85,8 @@ class TashkeelModel(pl.LightningModule):
                 trg_mask = self.transformer.make_pad_mask(trg, trg, self.transformer.trg_pad_idx, self.transformer.trg_pad_idx).to(device) * \
                            self.transformer.make_no_peak_mask(trg, trg).to(device)
 
-                preds = self.transformer.decoder(trg, enc_src, trg_mask, src_trg_mask)
+                preds = self.transformer.decoder(trg=trg, enc_src=enc_src,
+                                                 trg_mask=trg_mask, src_mask=src_trg_mask)
                 # IMPORTANT NOTE: the following code snippet is to FORCE the prediction of the input space char to output no_tashkeel tag '<NT>'
                 target_ids = torch.cat([target_ids, preds[:, -1].argmax(1).unsqueeze(1)], axis=1)
                 target_ids[self.tokenizer.letters_map[' '] == src[:, :target_ids.shape[1]]] = self.tokenizer.tashkeel_map[self.tokenizer.no_tashkeel_tag]

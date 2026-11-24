@@ -1,26 +1,19 @@
 
 import os
 import glob
+import re
+from itertools import islice
 import torch
-import bw2ar
+from torch.nn.functional import pad
 from tqdm import tqdm
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, Sampler
+
+DIACRITICS = '\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652'
+MARKED_RE = re.compile('[^\u064b-\u0652][\u064b-\u0652]')
+LIGATURE_RE = re.compile('[\ufefb\ufef7\ufef5\ufef9]')
 
 def get_files(mypath, extension='*.txt'):
     return [y for x in os.walk(mypath, followlinks=True) for y in glob.glob(os.path.join(x[0], extension), recursive=True)]
-
-# sequences is a list of tensors of shape TxH where T is the seqlen and H is the feats dim
-def pad_seq(sequences, batch_first=True, padding_value=0.0, prepadding=True):
-    lens = [i.shape[0]for i in sequences]
-    padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=padding_value) # NxTxH
-    if prepadding:
-        for i in range(len(lens)):
-            padded_sequences[i] = padded_sequences[i].roll(-lens[i])
-    if not batch_first:
-        padded_sequences = padded_sequences.transpose(0, 1) # TxNxH
-    return padded_sequences
-
 
 class TashkeelDataset(Dataset):
 
@@ -43,68 +36,102 @@ class TashkeelDataset(Dataset):
         # filter out texts that have less than "tashkeel_to_text_ratio_threshold"
         tmp = []
         for line in tqdm(self.prepared_lines, desc=f'Filtering out texts that have tashkeel to text ratio less than {tashkeel_to_text_ratio_threshold}'):
-            letter_n_tashkeel_pairs = self.tokenizer.split_tashkeel_from_text(line, test_match=False)
-            text, tashkeel = zip(*letter_n_tashkeel_pairs)
-            if (len(tashkeel) - tashkeel.count(self.tokenizer.no_tashkeel_tag)) / len(tashkeel) >= tashkeel_to_text_ratio_threshold:
-                tmp.append(line)
+            text = line.replace('\u0670', '')
+            letters = len(text) - sum(map(text.count, DIACRITICS)) + len(LIGATURE_RE.findall(text))
+            marked = len(MARKED_RE.findall(text))
+            # The tokenizer adds BOS and EOS as marked tokens.
+            if (marked + 2) / (letters + 2) >= tashkeel_to_text_ratio_threshold:
+                input_ids, target_ids = tokenizer.encode(line, test_match=False)
+                length = len(input_ids) - 1
+                if length <= max_seq_len:
+                    tmp.append((line, input_ids, target_ids))
 
-        self.prepared_lines = tmp
         print('Filteration process successfully completed!!')
         print(f'Remaining useable examples: {len(tmp)} / {total_lines_before_filteration}')
-        self.prepared_lines = sorted(self.prepared_lines, key=lambda x: len(x))
+        tmp.sort(key=lambda sample: len(sample[0]))
+        self.prepared_lines = [line for line, _, _ in tmp]
+        self.samples = [(input_ids, target_ids) for _, input_ids, target_ids in tmp]
+        self.lengths = [len(input_ids) - 1 for input_ids, _ in self.samples]
 
     def __len__(self):
         return len(self.prepared_lines)
 
     def __getitem__(self, index):
-        sample = self.prepared_lines[index]
-        input_ids, target_ids = self.tokenizer.encode(sample, test_match=False)
-        return input_ids, target_ids
+        return self.samples[index]
 
 
-class PrePaddingDataLoader(DataLoader):
-    def __init__(self, tokenizer, *args, **kwargs):
-        super(PrePaddingDataLoader, self).__init__(*args, **kwargs)
-        self.tokenizer = tokenizer
-        self.collate_fn = self._collate_fn
+def select_batch(buffer, bs, seq_max, sample_lengths):
+    lengths = [sample_lengths[index] for index in buffer]
+    total = sum(lengths[:bs])
+    if total < seq_max:
+        return buffer[:bs], buffer[bs:]
 
-    def _collate_fn(self, batch):
-        input_ids_list = []
-        target_ids_list = []
-        for input_ids, target_ids in batch:
-            input_ids_list.append(input_ids)
-            target_ids_list.append(target_ids)
-        batch_input_ids = pad_seq(input_ids_list, batch_first=True, padding_value=self.tokenizer.letters_map['<PAD>'], prepadding=False)
-        batch_target_ids = pad_seq(target_ids_list, batch_first=True, padding_value=self.tokenizer.tashkeel_map['<PAD>'], prepadding=False)
-        return batch_input_ids, batch_target_ids
+    buckets = [[] for _ in range(max(lengths) + 1)]
+    for i, length in enumerate(lengths):
+        buckets[length].append(i)
+    longest_first = [i for bucket in reversed(buckets) for i in bucket if i < bs]
+    shortest_first = [i for bucket in buckets for i in bucket if i >= bs]
 
-
-if __name__ == '__main__':
-    from tashkeel_tokenizer import TashkeelTokenizer
-    tokenizer = TashkeelTokenizer()
-
-    dl_num_workers = 2
-    batch_size = 32
-    max_seq_len = 1024
-
-    train_txt_folder_path = 'dataset/train'
-    val_txt_folder_path = 'dataset/val'
-    test_txt_folder_path = 'dataset/test'
-
-    threshold = 0.6
-    print('Creating Train Dataset...')
-    train_dataset = TashkeelDataset(train_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-    print('Creating Train Dataloader...')
-    train_dataloader = PrePaddingDataLoader(tokenizer, train_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=True)
-
-    print('Creating Val Dataset...')
-    val_dataset = TashkeelDataset(val_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-    print('Creating Val Dataloader...')
-    val_dataloader = PrePaddingDataLoader(tokenizer, val_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=False)
-
-    print('Creating Test Dataset...')
-    test_dataset = TashkeelDataset(test_txt_folder_path, tokenizer, max_seq_len, tashkeel_to_text_ratio_threshold=threshold)
-    print('Creating Test Dataloader...')
-    test_dataloader = PrePaddingDataLoader(tokenizer, test_dataset, batch_size=batch_size, num_workers=dl_num_workers, shuffle=False)
+    result = list(buffer)
+    for longest, shortest in zip(longest_first, shortest_first):
+        if total < seq_max:
+            break
+        if lengths[longest] <= lengths[shortest]:
+            return None, buffer
+        result[longest], result[shortest] = result[shortest], result[longest]
+        total += lengths[shortest] - lengths[longest]
+    if total >= seq_max:
+        return None, buffer
+    return result[:bs], result[bs:]
 
 
+class BufferedBatchSampler(Sampler):
+    def __init__(self, lengths, batch_size, token_capacity, shuffle=False, generator=None):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.token_capacity = token_capacity
+        self.shuffle = shuffle
+        self.generator = generator
+
+    def __len__(self):
+        return len(self.lengths) // self.batch_size
+
+    def __iter__(self):
+        indices = (torch.randperm(len(self.lengths), generator=self.generator).tolist()
+                   if self.shuffle else range(len(self.lengths)))
+        indices = iter(indices)
+        buffer = list(islice(indices, 2 * self.batch_size))
+        while len(buffer) >= self.batch_size:
+            batch, remaining = select_batch(
+                buffer=buffer, bs=self.batch_size, seq_max=self.token_capacity,
+                sample_lengths=self.lengths)
+            if batch is None:
+                # Keep complete samples; the collator uses the larger static capacity.
+                batch, remaining = buffer[:self.batch_size], buffer[self.batch_size:]
+            yield batch
+            buffer = remaining + list(islice(indices, self.batch_size))
+        # Drop only the final incomplete batch.
+
+
+def collate_packed(batch, *, token_capacity, max_seq_len, src_pad_idx, trg_pad_idx):
+    # Shift each sample independently, then concatenate; padding is only at the tail.
+    # Encoder: BOS + letters; decoder input: BOS + tags; labels: tags + EOS.
+    lengths = [len(src) - 1 for src, _ in batch]
+    tokens = sum(lengths)
+    capacity = token_capacity if tokens < token_capacity else len(batch) * max_seq_len + 1
+    padding = capacity - tokens
+    # Split the isolated padding tail into bounded dummy sequences. Empty dummy
+    # slots repeat the final offset so metadata shape stays fixed for each capacity.
+    tail_lengths = [min(max_seq_len, max(0, padding - start))
+                    for start in range(0, capacity, max_seq_len)]
+    cu_seqlens = torch.tensor([0] + lengths + tail_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    return {
+        'src': pad(torch.cat([src[:-1] for src, _ in batch]), (0, padding), value=src_pad_idx),
+        'trg': pad(torch.cat([trg[:-1] for _, trg in batch]), (0, padding), value=trg_pad_idx),
+        'labels': pad(torch.cat([trg[1:] for _, trg in batch]), (0, padding), value=-100),
+        'cu_seqlens': cu_seqlens,
+        'max_seqlen': max_seq_len,
+        'positions': pad(torch.cat([torch.arange(length) for length in lengths]), (0, padding)),
+        'lengths': lengths,
+        'tokens': tokens,
+    }

@@ -7,6 +7,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class EncoderLayer(nn.Module):
@@ -21,10 +22,10 @@ class EncoderLayer(nn.Module):
         self.norm2 = LayerNorm(d_model=d_model)
         self.dropout2 = nn.Dropout(p=drop_prob)
 
-    def forward(self, x, s_mask):
+    def forward(self, x, s_mask=None, seq_info=None):
         # 1. compute self attention
         _x = x
-        x = self.attention(q=x, k=x, v=x, mask=s_mask)
+        x = self.attention(q=x, k=x, v=x, mask=s_mask, q_info=seq_info, kv_info=seq_info)
         
         # 2. add and norm
         x = self.dropout1(x)
@@ -56,10 +57,11 @@ class DecoderLayer(nn.Module):
         self.norm3 = LayerNorm(d_model=d_model)
         self.dropout3 = nn.Dropout(p=drop_prob)
 
-    def forward(self, dec, enc, t_mask, s_mask):
+    def forward(self, dec, enc, t_mask=None, s_mask=None, trg_info=None, src_info=None):
         # 1. compute self attention
         _x = dec
-        x = self.self_attention(q=dec, k=dec, v=dec, mask=t_mask)
+        x = self.self_attention(q=dec, k=dec, v=dec, mask=t_mask,
+                                q_info=trg_info, kv_info=trg_info, causal=True)
         
         # 2. add and norm
         x = self.dropout1(x)
@@ -68,7 +70,8 @@ class DecoderLayer(nn.Module):
         if enc is not None:
             # 3. compute encoder - decoder attention
             _x = x
-            x = self.enc_dec_attention(q=x, k=enc, v=enc, mask=s_mask)
+            x = self.enc_dec_attention(q=x, k=enc, v=enc, mask=s_mask,
+                                       q_info=trg_info, kv_info=src_info)
             
             # 4. add and norm
             x = self.dropout2(x)
@@ -98,25 +101,8 @@ class ScaleDotProductAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, q, k, v, mask=None, e=1e-12):
-        # input is 4 dimension tensor
-        # [batch_size, head, length, d_tensor]
-        batch_size, head, length, d_tensor = k.size()
-
-        # 1. dot product Query with Key^T to compute similarity
-        k_t = k.transpose(2, 3)  # transpose
-        score = (q @ k_t) / math.sqrt(d_tensor)  # scaled dot product
-
-        # 2. apply masking (opt)
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -10000)
-
-        # 3. pass them softmax to make [0, 1] range
-        score = self.softmax(score)
-
-        # 4. multiply with Value
-        v = score @ v
-
-        return v, score
+        # The caller does not use attention weights. Let SDPA choose the backend.
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0), None
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -147,9 +133,21 @@ class MultiHeadAttention(nn.Module):
         self.w_v = nn.Linear(d_model, d_model, bias=False)
         self.w_concat = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, mask=None, q_info=None, kv_info=None, causal=False):
         # 1. dot product with weight matrices
         q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
+
+        if q_info is not None:
+            # Import only for packed CUDA execution; dense inference/export still uses SDPA.
+            from torch.nn.attention.varlen import varlen_attn
+
+            q = q.unflatten(-1, (self.n_head, -1))
+            k = k.unflatten(-1, (self.n_head, -1))
+            v = v.unflatten(-1, (self.n_head, -1))
+            out = varlen_attn(
+                q, k, v, q_info[0], kv_info[0], q_info[1], kv_info[1],
+                is_causal=causal)
+            return self.w_concat(out.flatten(-2))
 
         # 2. split tensor by number of heads
         q, k, v = self.split(q), self.split(k), self.split(v)
@@ -233,9 +231,9 @@ class TransformerEmbedding(nn.Module):
             self.pos_emb = SinusoidalPositionalEncoding(d_model, max_len)
         self.drop_out = nn.Dropout(p=drop_prob)
 
-    def forward(self, x):
+    def forward(self, x, positions=None):
         tok_emb = self.tok_emb(x)
-        pos_emb = self.pos_emb(x).to(tok_emb.device)
+        pos_emb = self.pos_emb(x, positions).to(tok_emb.device)
         return self.drop_out(tok_emb + pos_emb)
 
 
@@ -271,8 +269,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         super(SinusoidalPositionalEncoding, self).__init__()
 
         # same size with input matrix (for adding with input matrix)
-        self.encoding = torch.zeros(max_len, d_model)
-        self.encoding.requires_grad = False  # we don't need to compute gradient
+        self.register_buffer('encoding', torch.zeros(max_len, d_model), persistent=False)
 
         pos = torch.arange(0, max_len)
         pos = pos.float().unsqueeze(dim=1)
@@ -286,10 +283,12 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.encoding[:, 1::2] = torch.cos(pos / (10000 ** (_2i / d_model)))
         # compute positional encoding to consider positional information of words
 
-    def forward(self, x):
+    def forward(self, x, positions=None):
         # self.encoding
         # [max_len = 512, d_model = 512]
 
+        if positions is not None:
+            return self.encoding[positions]
         batch_size, seq_len = x.size()
         # [batch_size = 128, seq_len = 30]
 
@@ -315,9 +314,11 @@ class LearnablePositionalEncoding(nn.Module):
         self.max_seq_len = max_seq_len
         self.wpe = nn.Embedding(max_seq_len, d_model)
 
-    def forward(self, x):
+    def forward(self, x, positions=None):
         # self.encoding
         # [max_len = 512, d_model = 512]
+        if positions is not None:
+            return self.wpe(positions)
         device = x.device
         batch_size, seq_len = x.size()
         assert seq_len <= self.max_seq_len, f"Cannot forward sequence of length {seq_len}, max_seq_len is {self.max_seq_len}"
@@ -347,11 +348,11 @@ class Encoder(nn.Module):
                                                   drop_prob=drop_prob)
                                      for _ in range(n_layers)])
 
-    def forward(self, x, s_mask):
-        x = self.emb(x)
+    def forward(self, x, s_mask=None, seq_info=None, positions=None):
+        x = self.emb(x, positions)
 
         for layer in self.layers:
-            x = layer(x, s_mask)
+            x = layer(x, s_mask, seq_info)
 
         return x
 
@@ -374,11 +375,12 @@ class Decoder(nn.Module):
 
         self.linear = nn.Linear(d_model, dec_voc_size)
 
-    def forward(self, trg, enc_src, trg_mask, src_mask):
-        trg = self.emb(trg)
+    def forward(self, trg, enc_src, trg_mask=None, src_mask=None,
+                trg_info=None, src_info=None, positions=None):
+        trg = self.emb(trg, positions)
 
         for layer in self.layers:
-            trg = layer(trg, enc_src, trg_mask, src_mask)
+            trg = layer(trg, enc_src, trg_mask, src_mask, trg_info, src_info)
 
         # pass to LM head
         output = self.linear(trg)
