@@ -4,6 +4,7 @@ import random
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+import numpy as np
 
 import torch
 from torch.nn import functional as F
@@ -118,6 +119,19 @@ def validate(model, loader, tokenizer):
             'val_der_distance': distance, 'val_der_ref_length': ref_length,
             'val_der_mode': 'teacher_forced'}
 
+def estimate_tockens_budget(batch_size, lengths, percentile=99.9, trials=20_000, k=25):
+    assert k < batch_size
+    rng = np.random.default_rng(42)
+    batches = rng.choice(lengths, size=(trials, batch_size))
+    totals = batches.sum(axis=1)
+    
+    extra_batches = rng.choice(lengths, size=(trials, batch_size))
+    removed = np.sort(batches, axis=1)[:, -k:].sum(axis=1)
+    added = np.sort(extra_batches, axis=1)[:, :k].sum(axis=1)
+    swapped_totals = totals - removed + added
+
+    swapped_budget = int(np.percentile(swapped_totals, percentile, method="higher")) + 1
+    return swapped_budget
 
 def main():
     args = parse_args()
@@ -144,10 +158,13 @@ def main():
 
     tokenizer = TashkeelTokenizer()
     train_dataset = TashkeelDataset(args.train_dir, tokenizer, args.max_seq_len, args.threshold)
+    tokens_per_batch = estimate_tockens_budget(batch_size=args.batch_size, lengths=train_dataset.lengths)
+    print(f"{tokens_per_batch=}")
+
     val_dataset = TashkeelDataset(args.val_dir, tokenizer, args.max_seq_len, args.threshold)
     if min(len(train_dataset), len(val_dataset)) < args.batch_size:
         raise ValueError('Training and validation datasets must each contain at least one full batch.')
-    collate_fn = partial(collate_packed, token_capacity=args.tokens_per_batch,
+    collate_fn = partial(collate_packed, token_capacity=tokens_per_batch,
                          max_seq_len=args.max_seq_len,
                          src_pad_idx=tokenizer.letters_map['<PAD>'],
                          trg_pad_idx=tokenizer.tashkeel_map['<PAD>'])
@@ -155,8 +172,8 @@ def main():
                           collate_fn=collate_fn, pin_memory=True,
                           persistent_workers=args.num_workers > 0)
     train_sampler = BufferedBatchSampler(train_dataset.lengths, args.batch_size,
-                                         args.tokens_per_batch, shuffle=True, generator=generator)
-    val_sampler = BufferedBatchSampler(val_dataset.lengths, args.batch_size, args.tokens_per_batch)
+                                         tokens_per_batch, shuffle=True, generator=generator)
+    val_sampler = BufferedBatchSampler(val_dataset.lengths, args.batch_size, tokens_per_batch)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
                              generator=generator, **loader_options)
     val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, **loader_options)
