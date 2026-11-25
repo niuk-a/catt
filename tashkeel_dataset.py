@@ -94,14 +94,14 @@ class BufferedBatchSampler(Sampler):
         self.generator = generator
 
     def __len__(self):
-        return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
         indices = (torch.randperm(len(self.lengths), generator=self.generator).tolist()
                    if self.shuffle else range(len(self.lengths)))
         indices = iter(indices)
         buffer = list(islice(indices, 2 * self.batch_size))
-        while len(buffer) >= self.batch_size:
+        while buffer:
             batch, remaining = select_batch(
                 buffer=buffer, bs=self.batch_size, seq_max=self.token_capacity,
                 sample_lengths=self.lengths)
@@ -110,21 +110,21 @@ class BufferedBatchSampler(Sampler):
                 batch, remaining = buffer[:self.batch_size], buffer[self.batch_size:]
             yield batch
             buffer = remaining + list(islice(indices, self.batch_size))
-        # Drop only the final incomplete batch.
 
 
-def collate_packed(batch, *, token_capacity, max_seq_len, src_pad_idx, trg_pad_idx):
+def collate_packed(batch, *, batch_size, token_capacity, max_seq_len, src_pad_idx, trg_pad_idx):
     # Shift each sample independently, then concatenate; padding is only at the tail.
     # Encoder: BOS + letters; decoder input: BOS + tags; labels: tags + EOS.
     lengths = [len(src) - 1 for src, _ in batch]
     tokens = sum(lengths)
-    capacity = token_capacity if tokens < token_capacity else len(batch) * max_seq_len + 1
+    capacity = token_capacity if tokens < token_capacity else batch_size * max_seq_len + 1
     padding = capacity - tokens
     # Split the isolated padding tail into bounded dummy sequences. Empty dummy
     # slots repeat the final offset so metadata shape stays fixed for each capacity.
     tail_lengths = [min(max_seq_len, max(0, padding - start))
                     for start in range(0, capacity, max_seq_len)]
-    cu_seqlens = torch.tensor([0] + lengths + tail_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    padded_lengths = lengths + [0] * (batch_size - len(batch))
+    cu_seqlens = torch.tensor([0] + padded_lengths + tail_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
     return {
         'src': pad(torch.cat([src[:-1] for src, _ in batch]), (0, padding), value=src_pad_idx),
         'trg': pad(torch.cat([trg[:-1] for _, trg in batch]), (0, padding), value=trg_pad_idx),

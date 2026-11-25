@@ -158,13 +158,13 @@ def main():
 
     tokenizer = TashkeelTokenizer()
     train_dataset = TashkeelDataset(args.train_dir, tokenizer, args.max_seq_len, args.threshold)
+    val_dataset = TashkeelDataset(args.val_dir, tokenizer, args.max_seq_len, args.threshold)
+    if min(len(train_dataset), len(val_dataset)) == 0:
+        raise ValueError('Training and validation datasets must each contain at least one sample.')
     tokens_per_batch = estimate_tockens_budget(batch_size=args.batch_size, lengths=train_dataset.lengths)
     print(f"{tokens_per_batch=}")
 
-    val_dataset = TashkeelDataset(args.val_dir, tokenizer, args.max_seq_len, args.threshold)
-    if min(len(train_dataset), len(val_dataset)) < args.batch_size:
-        raise ValueError('Training and validation datasets must each contain at least one full batch.')
-    collate_fn = partial(collate_packed, token_capacity=tokens_per_batch,
+    collate_fn = partial(collate_packed, batch_size=args.batch_size, token_capacity=tokens_per_batch,
                          max_seq_len=args.max_seq_len,
                          src_pad_idx=tokenizer.letters_map['<PAD>'],
                          trg_pad_idx=tokenizer.tashkeel_map['<PAD>'])
