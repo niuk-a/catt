@@ -20,10 +20,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train packed CATT on one CUDA GPU.')
     parser.add_argument('--train-dir', default='dataset/train')
     parser.add_argument('--val-dir', default='dataset/val')
-    parser.add_argument('--output-dir', default='/data/catt')
-    parser.add_argument('--pretrained', default='models/char_bert_model_pretrained.pt',
-                        help='Pretrained weights; pass an empty string for random initialization.')
-    parser.add_argument('--resume', help='Resume a full checkpoint at the next epoch.')
+    parser.add_argument('--output-dir', default='/data/catt',
+                        help='Exact directory for metrics, run configuration, and profiles.')
+    parser.add_argument('--checkpoint-dir', default='/data/checkpoints',
+                        help='Load the alphabetically last file and save checkpoints here.')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--tokens-per-batch', type=int, default=16384,
@@ -55,7 +55,7 @@ class MetricLogger:
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
-            self._flush()
+            self.flush()
         finally:
             self.file.close()
 
@@ -66,9 +66,9 @@ class MetricLogger:
                for key, value in metrics.items()},
         })
         if len(self.records) >= self.flush_every:
-            self._flush()
+            self.flush()
 
-    def _flush(self):
+    def flush(self):
         if not self.records:
             return
         tensor_fields = [(record, key) for record in self.records
@@ -135,17 +135,19 @@ def estimate_tockens_budget(batch_size, lengths, percentile=99.9, trials=20_000,
 
 def main():
     args = parse_args()
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_path = max(checkpoint_dir.iterdir())
+    print(f'Loading checkpoint: {checkpoint_path}')
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.set_device(0)
     generator = torch.Generator().manual_seed(args.seed)
 
-    run_dir = Path(args.output_dir) / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
-    checkpoint_dir = run_dir / 'checkpoints'
+    run_dir = Path(args.output_dir)
     profile_dir = run_dir / 'profiles'
-    checkpoint_dir.mkdir(parents=True)
-    profile_dir.mkdir()
-    config = {**vars(args), 'device': torch.cuda.get_device_name(0),
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    config = {**vars(args), 'loaded_checkpoint': str(checkpoint_path),
+              'device': torch.cuda.get_device_name(0),
               'precision': 'bf16-mixed', 'compile': {'backend': 'inductor', 'dynamic': False},
               'optimizer': {'name': 'AdamW', 'fused': True},
               'fallback_token_capacity': args.batch_size * args.max_seq_len + 1,
@@ -183,8 +185,8 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=1 / 1.000001)
     start_epoch = global_step = 0
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    if 'optimizer' in checkpoint:
         if checkpoint['config']['max_seq_len'] != args.max_seq_len:
             raise ValueError('--max-seq-len must match the resumed checkpoint.')
         model.load_state_dict(checkpoint['state_dict'])
@@ -198,9 +200,8 @@ def main():
         torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
         random.setstate(checkpoint['python_rng_state'])
         generator.set_state(checkpoint['loader_rng_state'])
-    elif args.pretrained:
-        weights = torch.load(args.pretrained, map_location='cpu', weights_only=True)
-        weights = weights.get('state_dict', weights)
+    else:
+        weights = checkpoint.get('state_dict', checkpoint)
         weights = {key.removeprefix('transformer.'): value for key, value in weights.items()}
         print(f'Pretrained weights: {model.transformer.load_state_dict(weights, strict=False)}')
 
@@ -248,6 +249,7 @@ def main():
                 if launch_steps <= 17:
                     profiler.step()
 
+            logger.flush()
             # Validation/checkpoint work must not enter the two training-step trace,
             # including when a small dataset puts steps 16 and 17 in different epochs.
             if launch_steps < 17:
@@ -255,6 +257,7 @@ def main():
             metrics = validate(compiled_model, val_loader, tokenizer)
             metrics['train_loss'] = train_loss_sum.item() / train_tokens
             logger.log(event='epoch_end', epoch=epoch, step=global_step, **metrics)
+            logger.flush()
             checkpoint = {
                 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(), 'epoch': epoch,
@@ -263,13 +266,10 @@ def main():
                 'cuda_rng_state': torch.cuda.get_rng_state_all(),
                 'python_rng_state': random.getstate(), 'loader_rng_state': generator.get_state(),
             }
-            checkpoint_path = checkpoint_dir / f'epoch-{epoch:04d}.ckpt'
+            checkpoint_path = checkpoint_dir / f'train-epoch-{epoch:06d}.pt'
             temporary_path = checkpoint_path.with_suffix('.tmp')
             torch.save(checkpoint, temporary_path)
             temporary_path.replace(checkpoint_path)
-            last_link = checkpoint_dir / 'last.tmp'
-            last_link.symlink_to(checkpoint_path.name)
-            last_link.replace(checkpoint_dir / 'last.ckpt')
             print(f'Saved {checkpoint_path}; val_loss={metrics["val_loss"]:.5f}, '
                   f'val_der={metrics["val_der"]:.5f}')
         if launch_steps < 17:
