@@ -1,9 +1,13 @@
 import argparse
+import csv
 import json
 import random
+import subprocess
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Thread
 import numpy as np
 
 import torch
@@ -41,6 +45,47 @@ def parse_args():
     if args.log_every < 1:
         parser.error('--log-every must be positive.')
     return args
+
+
+class GPUMetricSampler:
+    def __init__(self):
+        self.records = Queue()
+        self.stop = Event()
+
+    def __enter__(self):
+        self.thread = Thread(target=self.sample, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop.set()
+        self.thread.join()
+
+    def sample(self):
+        while not self.stop.is_set():
+            timestamp = datetime.now(timezone.utc).isoformat()
+            try:
+                result = subprocess.run(
+                    ['nvidia-smi', '-i', '0',
+                     '--query-gpu=timestamp,utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm',
+                     '--format=csv'],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+                rows = csv.reader(result.stdout.splitlines(), skipinitialspace=True)
+                next(rows)  # CSV header includes units.
+                for row in rows:
+                    gpu_timestamp, utilization, memory, power, temperature, clock = row
+                    values = [None if value.strip().startswith('[') else float(value.split()[0])
+                              for value in (utilization, memory, power, temperature, clock)]
+                    self.records.put(dict(
+                        event='gpu_sample', timestamp=timestamp, gpu_timestamp=gpu_timestamp,
+                        gpu_utilization_pct=values[0], gpu_memory_used_mib=values[1],
+                        gpu_power_w=values[2], gpu_temperature_c=values[3], gpu_clock_sm_mhz=values[4],
+                    ))
+            except (OSError, subprocess.SubprocessError, ValueError, csv.Error, StopIteration) as exc:
+                self.records.put(dict(event='gpu_sample_error', timestamp=timestamp, error=str(exc)))
+            if self.stop.wait(10):
+                break
 
 
 class MetricLogger:
@@ -221,6 +266,7 @@ def main():
             on_trace_ready=save_trace, record_shapes=True, profile_memory=True,
         ) as profiler,
         MetricLogger(path=run_dir / 'metrics.jsonl', flush_every=args.log_every) as logger,
+        GPUMetricSampler() as gpu_sampler,
     ):
         for epoch in range(start_epoch + 1, args.epochs + 1):
             compiled_model.train()
@@ -246,6 +292,12 @@ def main():
                 logger.log(event='train_step', epoch=epoch, step=global_step,
                            train_loss=loss, lr=lr, tokens=tokens,
                            token_capacity=batch['labels'].numel())
+                while True:
+                    try:
+                        record = gpu_sampler.records.get_nowait()
+                    except Empty:
+                        break
+                    logger.log(**record)
                 if launch_steps <= 17:
                     profiler.step()
 
