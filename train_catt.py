@@ -322,6 +322,8 @@ def main():
             temporary_path = checkpoint_path.with_suffix('.tmp')
             torch.save(checkpoint, temporary_path)
             temporary_path.replace(checkpoint_path)
+            for old_checkpoint in sorted(checkpoint_dir.glob('train-epoch-*.pt'))[:-20]:
+                old_checkpoint.unlink()
             print(f'Saved {checkpoint_path}; val_loss={metrics["val_loss"]:.5f}, '
                   f'val_der={metrics["val_der"]:.5f}')
         if launch_steps < 17:
