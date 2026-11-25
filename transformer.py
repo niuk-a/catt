@@ -203,13 +203,7 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        var = x.var(-1, unbiased=False, keepdim=True)
-        # '-1' means last dimension. 
-
-        out = (x - mean) / torch.sqrt(var + self.eps)
-        out = self.gamma * out + self.beta
-        return out
+        return F.layer_norm(x, self.gamma.shape, self.gamma, self.beta, self.eps)
 
 
 class TransformerEmbedding(nn.Module):
