@@ -18,6 +18,7 @@ from tqdm import tqdm
 from ed_pl import TashkeelModel
 from tashkeel_dataset import TashkeelDataset, BufferedBatchSampler, collate_packed
 from tashkeel_tokenizer import TashkeelTokenizer
+import xer
 
 
 def parse_args():
@@ -164,6 +165,43 @@ def validate(model, loader, tokenizer):
             'val_der_distance': distance, 'val_der_ref_length': ref_length,
             'val_der_mode': 'teacher_forced'}
 
+def compute_benchmark_der(model):
+    tokenizer = model.tokenizer
+    data_path = Path(__file__).parent / 'benchmarking/eo_ed_mlm_ns/catt_data'
+    inputs = (data_path / 'CATT_data_gt_no_tashkeel.txt').read_text(encoding='utf-8').splitlines()
+    refs = (data_path / 'CATT_data_gt.txt').read_text(encoding='utf-8').splitlines()
+    assert len(refs) == len(inputs)
+    rows = [i for i, text in enumerate(inputs) if text.strip()]
+    predictions = model.do_tashkeel_batch([inputs[i] for i in rows], batch_size=16)
+    hypotheses = [''] * len(inputs)
+    for i, prediction in zip(rows, predictions):
+        hypotheses[i] = prediction
+
+    def plain(text):
+        return tokenizer.remove_tashkeel(text).replace('آ', 'ا').replace('إ', 'ا').replace('أ', 'ا').strip()
+
+    totals = {True: [0, 0, 0, 0], False: [0, 0, 0, 0]}
+    mismatches = 0
+    for ref, hyp in zip(refs, hypotheses):
+        ref = tokenizer.clean_text(ref.strip())
+        hyp = tokenizer.clean_text(hyp.strip())
+        if plain(ref) and xer.wer(plain(ref), plain(hyp))['Error Rate'] > 1:
+            mismatches += 1
+        for case_ending, total in totals.items():
+            der = tokenizer.compute_der(ref, hyp, case_ending=case_ending)
+            wer = tokenizer.compute_wer(ref, hyp, case_ending=case_ending)
+            total[0] += der['distance']
+            total[1] += der['ref_length']
+            total[2] += wer['distance']
+            total[3] += wer['ref_length']
+    scores = {
+        label: {'DER': 100 * total[0] / total[1], 'WER': 100 * total[2] / total[3]}
+        for label, total in (('CE', totals[True]), ('No CE', totals[False]))
+    }
+    scores['mismatched_samples'] = mismatches
+    return scores
+
+
 def estimate_tockens_budget(batch_size, lengths, percentile=99.9, trials=20_000, k=25):
     assert k < batch_size
     rng = np.random.default_rng(42)
@@ -308,6 +346,8 @@ def main():
                 profiler.toggle_collection_dynamic(False, activities)
             metrics = validate(compiled_model, val_loader, tokenizer)
             metrics['train_loss'] = train_loss_sum.item() / train_tokens
+            metrics['benchmark_scores'] = compute_benchmark_der(model)
+            print(f'Benchmark: {metrics["benchmark_scores"]}')
             logger.log(event='epoch_end', epoch=epoch, step=global_step, **metrics)
             logger.flush()
             checkpoint = {
